@@ -16,21 +16,30 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.iceberg.flink.source.reader;
+package org.apache.iceberg.rest.requests;
 
-import org.apache.flink.api.connector.source.SourceOutput;
-import org.apache.flink.connector.base.source.reader.RecordEmitter;
-import org.apache.iceberg.flink.source.split.IcebergSourceSplit;
+import java.util.Map;
+import javax.annotation.Nullable;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.rest.RESTRequest;
+import org.apache.iceberg.view.ViewVersion;
+import org.immutables.value.Value;
 
-final class IcebergSourceRecordEmitter<T>
-    implements RecordEmitter<RecordAndPosition<T>, T, IcebergSourceSplit> {
+@Value.Immutable
+public interface CreateViewRequest extends RESTRequest {
+  String name();
 
-  IcebergSourceRecordEmitter() {}
+  @Nullable
+  String location();
+
+  Schema schema();
+
+  ViewVersion viewVersion();
+
+  Map<String, String> properties();
 
   @Override
-  public void emitRecord(
-      RecordAndPosition<T> element, SourceOutput<T> output, IcebergSourceSplit split) {
-    output.collect(element.record());
-    split.updatePosition(element.fileOffset(), element.recordOffset());
+  default void validate() {
+    // nothing to validate as it's not possible to create an invalid instance
   }
 }

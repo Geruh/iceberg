@@ -16,21 +16,25 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.iceberg.flink.source.reader;
+package org.apache.iceberg.spark;
 
-import org.apache.flink.api.connector.source.SourceOutput;
-import org.apache.flink.connector.base.source.reader.RecordEmitter;
-import org.apache.iceberg.flink.source.split.IcebergSourceSplit;
+import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.types.Types;
+import org.apache.spark.sql.types.StructType;
 
-final class IcebergSourceRecordEmitter<T>
-    implements RecordEmitter<RecordAndPosition<T>, T, IcebergSourceSplit> {
+public class SparkDeleteFile extends SparkContentFile<DeleteFile> implements DeleteFile {
 
-  IcebergSourceRecordEmitter() {}
+  public SparkDeleteFile(Types.StructType type, StructType sparkType) {
+    super(type, null, sparkType);
+  }
+
+  public SparkDeleteFile(
+      Types.StructType type, Types.StructType projectedType, StructType sparkType) {
+    super(type, projectedType, sparkType);
+  }
 
   @Override
-  public void emitRecord(
-      RecordAndPosition<T> element, SourceOutput<T> output, IcebergSourceSplit split) {
-    output.collect(element.record());
-    split.updatePosition(element.fileOffset(), element.recordOffset());
+  protected DeleteFile asFile() {
+    return this;
   }
 }

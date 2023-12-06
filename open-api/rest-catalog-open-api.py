@@ -209,6 +209,35 @@ class MetadataLog(BaseModel):
     __root__: List[MetadataLogItem]
 
 
+class SQLViewRepresentation(BaseModel):
+    type: str
+    sql: str
+    dialect: str
+
+
+class ViewRepresentation(BaseModel):
+    __root__: SQLViewRepresentation
+
+
+class ViewHistoryEntry(BaseModel):
+    version_id: int = Field(..., alias='version-id')
+    timestamp_ms: int = Field(..., alias='timestamp-ms')
+
+
+class ViewVersion(BaseModel):
+    version_id: int = Field(..., alias='version-id')
+    timestamp_ms: int = Field(..., alias='timestamp-ms')
+    schema_id: int = Field(
+        ...,
+        alias='schema-id',
+        description='Schema ID to set as current, or -1 to set last added schema',
+    )
+    summary: Dict[str, str]
+    representations: List[ViewRepresentation]
+    default_catalog: Optional[str] = Field(None, alias='default-catalog')
+    default_namespace: Namespace = Field(..., alias='default-namespace')
+
+
 class BaseUpdate(BaseModel):
     action: Literal[
         'assign-uuid',
@@ -226,6 +255,8 @@ class BaseUpdate(BaseModel):
         'set-location',
         'set-properties',
         'remove-properties',
+        'add-view-version',
+        'set-current-view-version',
     ]
 
 
@@ -299,6 +330,18 @@ class SetPropertiesUpdate(BaseUpdate):
 
 class RemovePropertiesUpdate(BaseUpdate):
     removals: List[str]
+
+
+class AddViewVersionUpdate(BaseUpdate):
+    view_version: ViewVersion = Field(..., alias='view-version')
+
+
+class SetCurrentViewVersionUpdate(BaseUpdate):
+    view_version_id: int = Field(
+        ...,
+        alias='view-version-id',
+        description='The view version id to set as current, or -1 to set last added view version id',
+    )
 
 
 class TableRequirement(BaseModel):
@@ -571,7 +614,7 @@ class TransformTerm(BaseModel):
     term: Reference
 
 
-class ReportMetricsRequest1(CommitReport):
+class ReportMetricsRequest2(CommitReport):
     report_type: str = Field(..., alias='report-type')
 
 
@@ -675,6 +718,17 @@ class TableMetadata(BaseModel):
     metadata_log: Optional[MetadataLog] = Field(None, alias='metadata-log')
 
 
+class ViewMetadata(BaseModel):
+    view_uuid: str = Field(..., alias='view-uuid')
+    format_version: int = Field(..., alias='format-version', ge=1, le=1)
+    location: str
+    current_version_id: int = Field(..., alias='current-version-id')
+    versions: List[ViewVersion]
+    version_log: List[ViewHistoryEntry] = Field(..., alias='version-log')
+    schemas: List[Schema]
+    properties: Optional[Dict[str, str]] = None
+
+
 class AddSchemaUpdate(BaseUpdate):
     schema_: Schema = Field(..., alias='schema')
     last_column_id: Optional[int] = Field(
@@ -701,6 +755,19 @@ class TableUpdate(BaseModel):
         SetLocationUpdate,
         SetPropertiesUpdate,
         RemovePropertiesUpdate,
+    ]
+
+
+class ViewUpdate(BaseModel):
+    __root__: Union[
+        AssignUUIDUpdate,
+        UpgradeFormatVersionUpdate,
+        AddSchemaUpdate,
+        SetLocationUpdate,
+        SetPropertiesUpdate,
+        RemovePropertiesUpdate,
+        AddViewVersionUpdate,
+        SetCurrentViewVersionUpdate,
     ]
 
 
@@ -751,6 +818,13 @@ class CommitTableRequest(BaseModel):
     updates: List[TableUpdate]
 
 
+class CommitViewRequest(BaseModel):
+    identifier: Optional[TableIdentifier] = Field(
+        None, description='View identifier to update'
+    )
+    updates: List[ViewUpdate]
+
+
 class CommitTransactionRequest(BaseModel):
     table_changes: List[CommitTableRequest] = Field(..., alias='table-changes')
 
@@ -765,8 +839,43 @@ class CreateTableRequest(BaseModel):
     properties: Optional[Dict[str, str]] = None
 
 
-class ReportMetricsRequest2(BaseModel):
-    __root__: Union[ReportMetricsRequest, ReportMetricsRequest1]
+class CreateViewRequest(BaseModel):
+    name: str
+    location: Optional[str] = None
+    schema_: Schema = Field(..., alias='schema')
+    view_version: ViewVersion = Field(
+        ...,
+        alias='view-version',
+        description='The view version to create, will replace the schema-id sent within the view-version with the id assigned to the provided schema',
+    )
+    properties: Dict[str, str]
+
+
+class LoadViewResult(BaseModel):
+    """
+    Result used when a view is successfully loaded.
+
+
+    The view metadata JSON is returned in the `metadata` field. The corresponding file location of view metadata is returned in the `metadata-location` field.
+    Clients can check whether metadata has changed by comparing metadata locations after the view has been created.
+
+    The `config` map returns view-specific configuration for the view's resources.
+
+    The following configurations should be respected by clients:
+
+    ## General Configurations
+
+    - `token`: Authorization bearer token to use for view requests if OAuth2 security is enabled
+
+    """
+
+    metadata_location: str = Field(..., alias='metadata-location')
+    metadata: ViewMetadata
+    config: Optional[Dict[str, str]] = None
+
+
+class ReportMetricsRequest(BaseModel):
+    __root__: Union[ReportMetricsRequest1, ReportMetricsRequest2]
 
 
 class ScanReport(BaseModel):
@@ -792,7 +901,7 @@ class Schema(StructType):
     )
 
 
-class ReportMetricsRequest(ScanReport):
+class ReportMetricsRequest1(ScanReport):
     report_type: str = Field(..., alias='report-type')
 
 
@@ -801,6 +910,8 @@ ListType.update_forward_refs()
 MapType.update_forward_refs()
 Expression.update_forward_refs()
 TableMetadata.update_forward_refs()
+ViewMetadata.update_forward_refs()
 AddSchemaUpdate.update_forward_refs()
 CreateTableRequest.update_forward_refs()
-ReportMetricsRequest2.update_forward_refs()
+CreateViewRequest.update_forward_refs()
+ReportMetricsRequest.update_forward_refs()
