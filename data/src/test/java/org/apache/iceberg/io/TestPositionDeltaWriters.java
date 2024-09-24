@@ -137,8 +137,14 @@ public abstract class TestPositionDeltaWriters<T> extends WriterTestBase<T> {
   }
 
   @TestTemplate
-  public void testPositionDeltaDeleteOnly() throws IOException {
-    FileWriterFactory<T> writerFactory = newWriterFactory(table.schema());
+  public void testEqualityDeltaDeleteOnly() throws IOException {
+    //    FileWriterFactory<T> writerFactory = newWriterFactory(table.schema());
+    List<Integer> equalityFieldIds =
+        ImmutableList.of(
+            table.schema().findField("id").fieldId(), table.schema().findField("data").fieldId());
+    //    Schema equalityDeleteRowSchema = table.schema().select("id");
+    FileWriterFactory<T> writerFactory =
+        newWriterFactory(table.schema(), equalityFieldIds, table.schema());
 
     // add an unpartitioned data file
     ImmutableList<T> rows1 = ImmutableList.of(toRow(1, "aaa"), toRow(2, "aaa"), toRow(11, "aaa"));
@@ -160,16 +166,16 @@ public abstract class TestPositionDeltaWriters<T> extends WriterTestBase<T> {
 
     ClusteredDataWriter<T> insertWriter =
         new ClusteredDataWriter<>(writerFactory, fileFactory, table.io(), TARGET_FILE_SIZE);
-    ClusteredDataWriter<T> updateWriter =
-        new ClusteredDataWriter<>(writerFactory, fileFactory, table.io(), TARGET_FILE_SIZE);
-    ClusteredPositionDeleteWriter<T> deleteWriter =
-        new ClusteredPositionDeleteWriter<>(
+    //    ClusteredDataWriter<T> updateWriter =
+    //            new ClusteredDataWriter<>(writerFactory, fileFactory, table.io(),
+    // TARGET_FILE_SIZE);
+    ClusteredEqualityDeleteWriter<T> deleteWriter =
+        new ClusteredEqualityDeleteWriter<>(
             writerFactory, fileFactory, table.io(), TARGET_FILE_SIZE);
-    PositionDeltaWriter<T> deltaWriter =
-        new BasePositionDeltaWriter<>(insertWriter, updateWriter, deleteWriter);
+    EqualityDeltaWriter<T> deltaWriter = new BaseEqualityDeltaWriter<>(insertWriter, deleteWriter);
 
-    deltaWriter.delete(dataFile1.path(), 2L, unpartitionedSpec, null);
-    deltaWriter.delete(dataFile2.path(), 1L, partitionedSpec, partitionKey(partitionedSpec, "bbb"));
+    deltaWriter.delete(toRow(11, "aaa"), unpartitionedSpec, null);
+    deltaWriter.delete(toRow(4, "bbb"), partitionedSpec, partitionKey(partitionedSpec, "bbb"));
 
     deltaWriter.close();
 

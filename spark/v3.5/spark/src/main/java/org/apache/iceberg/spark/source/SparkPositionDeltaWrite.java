@@ -42,36 +42,45 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.SnapshotSummary;
 import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.data.InternalRecordWrapper;
 import org.apache.iceberg.deletes.DeleteGranularity;
 import org.apache.iceberg.deletes.PositionDelete;
 import org.apache.iceberg.exceptions.CleanableFailure;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
-import org.apache.iceberg.io.BasePositionDeltaWriter;
+import org.apache.iceberg.io.BaseEqualityDeltaWriter;
+import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.ClusteredDataWriter;
+import org.apache.iceberg.io.ClusteredEqualityDeleteWriter;
 import org.apache.iceberg.io.ClusteredPositionDeleteWriter;
 import org.apache.iceberg.io.DataWriteResult;
 import org.apache.iceberg.io.DeleteWriteResult;
+import org.apache.iceberg.io.EqualityDeltaWriter;
 import org.apache.iceberg.io.FanoutDataWriter;
+import org.apache.iceberg.io.FanoutEqualityDeleteWriter;
 import org.apache.iceberg.io.FanoutPositionOnlyDeleteWriter;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.io.PartitioningWriter;
-import org.apache.iceberg.io.PositionDeltaWriter;
 import org.apache.iceberg.io.WriteResult;
+import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.spark.CommitMetadata;
 import org.apache.iceberg.spark.SparkSchemaUtil;
 import org.apache.iceberg.spark.SparkWriteConf;
 import org.apache.iceberg.spark.SparkWriteRequirements;
+import org.apache.iceberg.spark.data.SparkParquetReaders;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.ArrayUtil;
 import org.apache.iceberg.util.CharSequenceSet;
 import org.apache.iceberg.util.StructProjection;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
 import org.apache.spark.sql.connector.distributions.Distribution;
 import org.apache.spark.sql.connector.expressions.SortOrder;
 import org.apache.spark.sql.connector.write.DeltaBatchWrite;
@@ -84,6 +93,7 @@ import org.apache.spark.sql.connector.write.RequiresDistributionAndOrdering;
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.types.StructType;
+import org.apache.spark.unsafe.types.UTF8String;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -382,8 +392,11 @@ class SparkPositionDeltaWrite implements DeltaWrite, RequiresDistributionAndOrde
               .deleteFileFormat(context.deleteFileFormat())
               .positionDeleteSparkType(context.deleteSparkType())
               .writeProperties(writeProperties)
+              .equalityDeleteRowSchema(table.schema().select("data"))
+              .equalityFieldIds(ArrayUtil.toIntArray(Lists.newArrayList(2)))
               .build();
 
+      // if using positional deletes and this otherwise we can write out partitioned eq deletes
       if (command == DELETE) {
         return new DeleteOnlyDeltaWriter(table, writerFactory, deleteFileFactory, context);
 
@@ -452,11 +465,24 @@ class SparkPositionDeltaWrite implements DeltaWrite, RequiresDistributionAndOrde
             writers, files, io, targetFileSize, deleteGranularity);
       }
     }
+
+    protected PartitioningWriter<InternalRow, DeleteWriteResult> newEqualityDeleteWriter(
+        Table table, SparkFileWriterFactory writers, OutputFileFactory files, Context context) {
+
+      FileIO io = table.io();
+      boolean useFanoutWriter = context.useFanoutWriter();
+      long targetFileSize = context.targetDataFileSize();
+
+      if (table.spec().isPartitioned() && useFanoutWriter) {
+        return new ClusteredEqualityDeleteWriter<>(writers, files, io, targetFileSize);
+      } else {
+        return new FanoutEqualityDeleteWriter<>(writers, files, io, targetFileSize);
+      }
+    }
   }
 
   private static class DeleteOnlyDeltaWriter extends BaseDeltaWriter {
-    private final PartitioningWriter<PositionDelete<InternalRow>, DeleteWriteResult> delegate;
-    private final PositionDelete<InternalRow> positionDelete;
+    private final PartitioningWriter<InternalRow, DeleteWriteResult> delegate;
     private final FileIO io;
     private final Map<Integer, PartitionSpec> specs;
     private final InternalRowWrapper partitionRowWrapper;
@@ -467,6 +493,7 @@ class SparkPositionDeltaWrite implements DeltaWrite, RequiresDistributionAndOrde
     private final int positionOrdinal;
 
     private boolean closed = false;
+    private final Table table;
 
     DeleteOnlyDeltaWriter(
         Table table,
@@ -474,10 +501,10 @@ class SparkPositionDeltaWrite implements DeltaWrite, RequiresDistributionAndOrde
         OutputFileFactory deleteFileFactory,
         Context context) {
 
-      this.delegate = newDeleteWriter(table, writerFactory, deleteFileFactory, context);
-      this.positionDelete = PositionDelete.create();
+      this.delegate = newEqualityDeleteWriter(table, writerFactory, deleteFileFactory, context);
       this.io = table.io();
       this.specs = table.specs();
+      this.table = table;
 
       Types.StructType partitionType = Partitioning.partitionType(table);
       this.partitionRowWrapper = initPartitionRowWrapper(partitionType);
@@ -494,14 +521,32 @@ class SparkPositionDeltaWrite implements DeltaWrite, RequiresDistributionAndOrde
       int specId = metadata.getInt(specIdOrdinal);
       PartitionSpec spec = specs.get(specId);
 
-      InternalRow partition = metadata.getStruct(partitionOrdinal, partitionRowWrapper.size());
-      StructProjection partitionProjection = partitionProjections.get(specId);
-      partitionProjection.wrap(partitionRowWrapper.wrap(partition));
+      //      InternalRow partition = metadata.getStruct(partitionOrdinal,
+      // partitionRowWrapper.size());
+      //      StructProjection partitionProjection = partitionProjections.get(specId);
+      //      partitionProjection.wrap(partitionRowWrapper.wrap(partition));
 
       String file = id.getString(fileOrdinal);
-      long position = id.getLong(positionOrdinal);
-      positionDelete.set(file, position, null);
-      delegate.write(positionDelete, spec, partitionProjection);
+      //      long position = id.getLong(positionOrdinal);
+      //      positionDelete.set(file, position, null);
+      //      delegate.write(positionDelete, spec, partitionProjection);
+//      InputFile inputFile = io.newInputFile(file);
+//      delegate.write(Parquet.read(inputFile).project(table.schema()).build().iterator().next().get("data"));
+//      dataPartitionKey.partition(internalRowDataWrapper.wrap(id));
+//      delegate.write(id, spec, dataPartitionKey);
+      InternalRow row = new GenericInternalRow(1);
+      row.update(0, loadRow(io.newInputFile(file)).get(id.getInt(partitionOrdinal)).getInt(1));
+      delegate.write(row, spec, null);
+    }
+
+    private List<InternalRow> loadRow(InputFile file) throws IOException {
+      try (CloseableIterable<InternalRow> reader =
+                   Parquet.read(file)
+                           .project(table.schema())
+                           .createReaderFunc(type -> SparkParquetReaders.buildReader(table.schema(), type))
+                           .build()) {
+        return Lists.newArrayList(reader);
+      }
     }
 
     @Override
@@ -543,7 +588,7 @@ class SparkPositionDeltaWrite implements DeltaWrite, RequiresDistributionAndOrde
 
   @SuppressWarnings("checkstyle:VisibilityModifier")
   private abstract static class DeleteAndDataDeltaWriter extends BaseDeltaWriter {
-    protected final PositionDeltaWriter<InternalRow> delegate;
+    protected final EqualityDeltaWriter<InternalRow> delegate;
     private final FileIO io;
     private final Map<Integer, PartitionSpec> specs;
     private final InternalRowWrapper deletePartitionRowWrapper;
@@ -562,9 +607,9 @@ class SparkPositionDeltaWrite implements DeltaWrite, RequiresDistributionAndOrde
         OutputFileFactory deleteFileFactory,
         Context context) {
       this.delegate =
-          new BasePositionDeltaWriter<>(
+          new BaseEqualityDeltaWriter<>(
               newDataWriter(table, writerFactory, dataFileFactory, context),
-              newDeleteWriter(table, writerFactory, deleteFileFactory, context));
+              newEqualityDeleteWriter(table, writerFactory, deleteFileFactory, context));
       this.io = table.io();
       this.specs = table.specs();
 
@@ -580,16 +625,21 @@ class SparkPositionDeltaWrite implements DeltaWrite, RequiresDistributionAndOrde
 
     @Override
     public void delete(InternalRow meta, InternalRow id) throws IOException {
-      int specId = meta.getInt(specIdOrdinal);
-      PartitionSpec spec = specs.get(specId);
+      //      int specId = meta.getInt(specIdOrdinal);
+      //      PartitionSpec spec = specs.get(specId);
 
-      InternalRow partition = meta.getStruct(partitionOrdinal, deletePartitionRowWrapper.size());
-      StructProjection partitionProjection = deletePartitionProjections.get(specId);
-      partitionProjection.wrap(deletePartitionRowWrapper.wrap(partition));
+      //      InternalRow partition = meta.getStruct(partitionOrdinal,
+      // deletePartitionRowWrapper.size());
+      //      StructProjection partitionProjection = deletePartitionProjections.get(specId);
+      //      partitionProjection.wrap(deletePartitionRowWrapper.wrap(partition));
 
-      String file = id.getString(fileOrdinal);
-      long position = id.getLong(positionOrdinal);
-      delegate.delete(file, position, spec, partitionProjection);
+//      String file = id.getString(fileOrdinal);
+      //      long position = id.getLong(positionOrdinal);
+      //      delegate.delete(file, position, spec, partitionProjection);
+
+      //      dataPartitionKey.partition(internalRowDataWrapper.wrap(row));
+//      InputFile inputFile = io.newInputFile(file);
+      delegate.delete(id, null, null);
     }
 
     @Override
